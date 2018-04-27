@@ -1,0 +1,227 @@
+--- a/dns.c
++++ b/dns.c
+@@ -202,7 +202,7 @@ is_numeric_hostname(const char *hostname
+  */
+ int
+ verify_host_key_dns(const char *hostname, struct sockaddr *address,
+-    struct sshkey *hostkey, int *flags)
++    struct sshkey *hostkey, int *flags, int supresserror)
+ {
+ 	u_int counter;
+ 	int result;
+@@ -244,7 +244,9 @@ verify_host_key_dns(const char *hostname
+ 	    DNS_RDATATYPE_SSHFP, rrset_flags, &fingerprints);
+ 
+ 	if (result) {
+-		verbose("DNS lookup error: %s", dns_result_totext(result));
++		if(supresserror!=1){
++			verbose("DNS lookup error: %s", dns_result_totext(result));
++		}
+ 		return -1;
+ 	}
+ 
+@@ -320,6 +322,36 @@ verify_host_key_dns(const char *hostname
+ 	return 0;
+ }
+ 
++int
++verify_host_key_dns_lookaside(const char *hostname, struct sockaddr *address,
++    struct sshkey *hostkey, int *flags, const char *lookasidename)
++{
++
++	//verify with basename first with error supression
++	if(verify_host_key_dns(hostname, address, hostkey, flags, 1)==0){
++		//no error
++		if(*flags & DNS_VERIFY_MATCH && *flags & DNS_VERIFY_SECURE){
++			//the hostname was fine
++			return 0;
++		}
++	}
++
++	debug3("proceeding with lookaside");
++
++	//create a new lookaside stuffed hostname
++	char *lookasidestuffed = malloc(strlen(lookasidename)+strlen(hostname)+2);
++	strcpy(lookasidestuffed, hostname);
++	strcat(lookasidestuffed, ".");
++	strcat(lookasidestuffed, lookasidename);
++
++	//check the lookaside name as well but in quiet mode in case there is a missing name or something
++	int res= verify_host_key_dns(lookasidestuffed, address, hostkey, flags, 1);
++
++	free(lookasidestuffed);
++	
++	return res;
++}
++
+ /*
+  * Export the fingerprint of a key as a DNS resource record
+  */
+--- a/dns.h
++++ b/dns.h
+@@ -51,7 +51,9 @@ enum sshfp_hashes {
+ #define DNS_VERIFY_SECURE	0x00000004
+ 
+ int	verify_host_key_dns(const char *, struct sockaddr *,
+-    struct sshkey *, int *);
++    struct sshkey *, int *, int);
++int	verify_host_key_dns_lookaside(const char *, struct sockaddr *,
++    struct sshkey *, int *, const char *);
+ int	export_dns_rr(const char *, struct sshkey *, FILE *, int);
+ 
+ #endif /* DNS_H */
+--- a/readconf.c
++++ b/readconf.c
+@@ -158,10 +158,10 @@ typedef enum {
+ 	oDynamicForward, oPreferredAuthentications, oHostbasedAuthentication,
+ 	oHostKeyAlgorithms, oBindAddress, oPKCS11Provider,
+ 	oClearAllForwardings, oNoHostAuthenticationForLocalhost,
+-	oEnableSSHKeysign, oRekeyLimit, oVerifyHostKeyDNS, oConnectTimeout,
++	oEnableSSHKeysign, oRekeyLimit, oVerifyHostKeyDNS, oVerifyHostKeyDNSLookaside, oVerifyHostKeyDNSLookasideName, oConnectTimeout,
+ 	oAddressFamily, oGssAuthentication, oGssDelegateCreds,
+ 	oGssTrustDns, oGssKeyEx, oGssClientIdentity, oGssRenewalRekey,
+-	oGssServerIdentity, 
++	oGssServerIdentity,
+ 	oServerAliveInterval, oServerAliveCountMax, oIdentitiesOnly,
+ 	oSendEnv, oControlPath, oControlMaster, oControlPersist,
+ 	oHashKnownHosts,
+@@ -273,6 +273,8 @@ static struct {
+ 	{ "clearallforwardings", oClearAllForwardings },
+ 	{ "enablesshkeysign", oEnableSSHKeysign },
+ 	{ "verifyhostkeydns", oVerifyHostKeyDNS },
++  { "verifyhostkeydnslookaside", oVerifyHostKeyDNSLookaside },
++  { "verifyhostkeydnslookasidename", oVerifyHostKeyDNSLookasideName },
+ 	{ "nohostauthenticationforlocalhost", oNoHostAuthenticationForLocalhost },
+ 	{ "rekeylimit", oRekeyLimit },
+ 	{ "connecttimeout", oConnectTimeout },
+@@ -1013,6 +1015,15 @@ parse_time:
+ 		multistate_ptr = multistate_yesnoask;
+ 		goto parse_multistate;
+ 
++  case oVerifyHostKeyDNSLookaside:
++		intptr = &options->verify_host_key_dns_lookaside;
++		multistate_ptr = multistate_yesnoask;
++		goto parse_multistate;
++
++  case oVerifyHostKeyDNSLookasideName:
++		charptr = &options->lookaside_name;
++		goto parse_string;
++
+ 	case oStrictHostKeyChecking:
+ 		intptr = &options->strict_host_key_checking;
+ 		multistate_ptr = multistate_yesnoask;
+@@ -1867,6 +1878,8 @@ initialize_options(Options * options)
+ 	options->rekey_limit = - 1;
+ 	options->rekey_interval = -1;
+ 	options->verify_host_key_dns = -1;
++  options->verify_host_key_dns_lookaside = -1;
++  options->lookaside_name = NULL;
+ 	options->server_alive_interval = -1;
+ 	options->server_alive_count_max = -1;
+ 	options->num_send_env = 0;
+--- a/readconf.h
++++ b/readconf.h
+@@ -95,6 +95,10 @@ typedef struct {
+ 	char   *pkcs11_provider; /* PKCS#11 provider */
+ 	int	verify_host_key_dns;	/* Verify host key using DNS */
+ 
++	//lookaside
++	int verify_host_key_dns_lookaside;
++	char *lookaside_name; //hostname to append to the name before lookingup
++
+ 	int     num_identity_files;	/* Number of files for RSA/DSA identities. */
+ 	char   *identity_files[SSH_MAX_IDENTITY_FILES];
+ 	int    identity_file_userprovided[SSH_MAX_IDENTITY_FILES];
+--- a/ssh_config.5
++++ b/ssh_config.5
+@@ -775,11 +775,11 @@ GSSAPI key exchange the server need not
+ The default is
+ .Cm no .
+ .It Cm GSSAPIClientIdentity
+-If set, specifies the GSSAPI client identity that ssh should use when 
+-connecting to the server. The default is unset, which means that the default 
++If set, specifies the GSSAPI client identity that ssh should use when
++connecting to the server. The default is unset, which means that the default
+ identity will be used.
+ .It Cm GSSAPIServerIdentity
+-If set, specifies the GSSAPI server identity that ssh should expect when 
++If set, specifies the GSSAPI server identity that ssh should expect when
+ connecting to the server. The default is unset, which means that the
+ expected GSSAPI server identity will be determined from the target
+ hostname.
+@@ -788,18 +788,18 @@ Forward (delegate) credentials to the se
+ The default is
+ .Cm no .
+ .It Cm GSSAPIRenewalForcesRekey
+-If set to 
++If set to
+ .Cm yes
+ then renewal of the client's GSSAPI credentials will force the rekeying of the
+-ssh connection. With a compatible server, this can delegate the renewed 
++ssh connection. With a compatible server, this can delegate the renewed
+ credentials to a session on the server.
+ The default is
+ .Cm no .
+ .It Cm GSSAPITrustDns
+-Set to 
++Set to
+ .Cm yes
+ to indicate that the DNS is trusted to securely canonicalize
+-the name of the host being connected to. If 
++the name of the host being connected to. If
+ .Cm no ,
+ the hostname entered on the
+ command line will be passed untouched to the GSSAPI library.
+@@ -1705,6 +1705,14 @@ need to confirm new host keys according
+ option.
+ The default is
+ .Cm no .
++.It Cm VerifyHostKeyDNSLookaside
++Specifies whether to verify the remote key using DNS and SSHFP resource
++records looking under a lookaside domain name if nothing found against the hostname
++If this option is set to
++.Cm yes ,
++the client will try lookaside checks
++.It Cm VerifyHostKeyDNSLookasideName
++The DNS lookaside hostname to use
+ .Pp
+ See also
+ .Sx VERIFYING HOST KEYS
+--- a/sshconnect.c
++++ b/sshconnect.c
+@@ -889,7 +889,7 @@ check_host_key(char *hostname, struct so
+ 		ip_status = check_key_in_hostkeys(ip_hostkeys, host_key,
+ 		    &ip_found);
+ 		if (host_status == HOST_CHANGED &&
+-		    (ip_status != HOST_CHANGED || 
++		    (ip_status != HOST_CHANGED ||
+ 		    (ip_found != NULL &&
+ 		    !key_equal(ip_found->key, host_found->key))))
+ 			host_ip_differ = 1;
+@@ -1161,7 +1161,7 @@ check_host_key(char *hostname, struct so
+ 		if (options.exit_on_forward_failure && cancelled_forwarding)
+ 			fatal("Error: forwarding disabled due to host key "
+ 			    "check failure");
+-		
++
+ 		/*
+ 		 * XXX Should permit the user to change to use the new id.
+ 		 * This could be done by converting the host key to an
+@@ -1319,7 +1319,16 @@ verify_host_key(char *host, struct socka
+ 			goto out;
+ 		if (sshkey_is_cert(plain))
+ 			sshkey_drop_cert(plain);
+-		if (verify_host_key_dns(host, hostaddr, plain, &flags) == 0) {
++    int dnsresult = -1;
++    if(options.verify_host_key_dns_lookaside==1){
++      debug2("using lookaside dns lookup against %s with lookaside name %s", host, options.lookaside_name);
++      dnsresult=verify_host_key_dns_lookaside(host, hostaddr, plain, &flags, options.lookaside_name);
++    }else{
++      //use the standard lookup
++      debug2("using standard dns lookup against %s", host);
++      dnsresult=verify_host_key_dns(host, hostaddr, plain, &flags, 0);
++    }
++		if (dnsresult == 0) {
+ 			if (flags & DNS_VERIFY_FOUND) {
+ 				if (options.verify_host_key_dns == 1 &&
+ 				    flags & DNS_VERIFY_MATCH &&

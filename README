@@ -1,0 +1,2 @@
+This is a patch for OpenSSH that adds support for lookaside sshfp retrival. This can be used where your main zone is for some reason not dnssec signed but you would like to take advantage of sshfp records for hosts contained within it.
+By configuring clients to use lookaside validation for the host key, ssh will check for sshfp records that validate at both the hostname but also at *hostname*.*lookaside-zone* if the hostname does not have any valid sshfp records.
